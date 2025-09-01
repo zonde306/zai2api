@@ -310,6 +310,8 @@ async function handleStreamResponse(
             break;
           }
 
+          debugLog(`time: ${performance.now()}, response: ${upstreamData.data?.delta_content}`);
+
           if (upstreamData.data.delta_content) {
             let out = upstreamData.data.delta_content;
             if (upstreamData.data.phase === "thinking") {
