@@ -21,7 +21,7 @@ const DEBUG_MODE = getEnv("DEBUG_MODE", "true") === "true";
 const DEFAULT_STREAM = getEnv("DEFAULT_STREAM", "true") === "true";
 
 // 思考内容处理策略 ("strip": 去除<details>标签; "think": 转为<think>标签; "raw": 保留原样)
-const THINK_TAGS_MODE: "strip" | "think" | "raw" = "raw";
+const THINK_TAGS_MODE: "strip" | "think" | "raw" = "strip";
 
 // 伪装前端头部
 const X_FE_VERSION = "prod-fe-1.0.70";
@@ -289,6 +289,7 @@ async function handleStreamResponse(
         // *** FIX: 使用底层的 Web Stream Reader，而不是 deno/std 的 readLines ***
         const reader = upstreamResponse.body.getReader();
         let buffer = '';
+        let thinking = false;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -330,6 +331,13 @@ async function handleStreamResponse(
               let out = upstreamData.data.delta_content;
               if (upstreamData.data.phase === "thinking") {
                 out = transformThinking(out);
+                if(!thinking) {
+                    thinking = true;
+                    out = "<think>\n" + out;
+                }
+              } else if(thinking && out) {
+                  thinking = false;
+                  out += "\n</think>";
               }
               if (out) {
                 const chunk: OpenAIResponse = {
@@ -409,6 +417,7 @@ async function handleNonStreamResponse(
 
     let fullContent = "";
     let finalUsage: Usage | undefined = undefined;
+    let thinking = false;
 
     // --- FIX START ---
     // 正确地将 Web Stream 转换为 Deno Reader 以便 readLines 使用
@@ -431,6 +440,13 @@ async function handleNonStreamResponse(
             let out = upstreamData.data.delta_content;
             if (upstreamData.data.phase === "thinking") {
                 out = transformThinking(out);
+                if(!thinking) {
+                    thinking = true;
+                    out = "<think>\n" + out;
+                }
+            } else if(thinking && out) {
+                thinking = false;
+                out += "\n</think>";
             }
             if (out) {
                 fullContent += out;
