@@ -259,8 +259,8 @@ async function handleStreamResponse(
   authToken: string,
 ): Promise<Response> {
   const upstreamResponsePromise = callUpstream(upstreamReq, chatId, authToken);
-  
-  // *** FIX: Create a TextEncoder instance once ***
+
+  // *** FIX: 创建一个 TextEncoder 实例，后续所有字符串编码都用它 ***
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
@@ -271,10 +271,11 @@ async function handleStreamResponse(
         if (!upstreamResponse.ok || !upstreamResponse.body) {
           const errorBody = await upstreamResponse.text();
           debugLog(`Upstream error: ${upstreamResponse.status}`, errorBody);
-          controller.close();
+          // 确保在出错时关闭流
+          try { controller.close(); } catch {}
           return;
         }
-        
+
         const firstChunk: OpenAIResponse = {
           id: `chatcmpl-${Date.now()}`,
           object: "chat.completion.chunk",
@@ -282,19 +283,19 @@ async function handleStreamResponse(
           model: MODEL_NAME,
           choices: [{ index: 0, delta: { role: "assistant" } }],
         };
-        
-        // *** FIX: Encode the string before enqueuing ***
+
+        // *** FIX: 在推入队列前，将字符串编码为 Uint8Array ***
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(firstChunk)}\n\n`));
         debugLog("First chunk sent to client.");
 
         const denoReader = readerFromStreamReader(upstreamResponse.body.getReader());
-        
+
         for await (const line of readLines(denoReader)) {
           if (!line.startsWith("data: ")) continue;
-      
+
           const dataStr = line.substring(6);
-          if (!dataStr) continue;
-      
+          if (!dataStr || dataStr === "[DONE]") continue; // 增加对 [DONE] 字符串的过滤
+
           let upstreamData: UpstreamData;
           try {
             upstreamData = JSON.parse(dataStr);
@@ -302,13 +303,13 @@ async function handleStreamResponse(
             debugLog("Failed to parse SSE data:", dataStr);
             continue;
           }
-      
+
           const err = upstreamData.error || upstreamData.data.error || upstreamData.data.inner?.error;
           if (err) {
             debugLog(`Upstream error in stream: code=${err.code}, detail=${err.detail}`);
             break;
           }
-      
+
           if (upstreamData.data.delta_content) {
             let out = upstreamData.data.delta_content;
             if (upstreamData.data.phase === "thinking") {
@@ -322,18 +323,18 @@ async function handleStreamResponse(
                 model: MODEL_NAME,
                 choices: [{ index: 0, delta: { content: out } }],
               };
-              // *** FIX: Encode the string before enqueuing ***
+              // *** FIX: 在推入队列前，将字符串编码为 Uint8Array ***
               controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
             }
           }
-
-          // --- 新增逻辑: 处理 EditContent 中的初始 answer 内容 ---
+          
+          // ... 您其他的 edit_content 逻辑保持不变 ...
           if (upstreamData.data.edit_content && upstreamData.data.phase === "answer") {
             const out = upstreamData.data.edit_content;
-            const parts = out.split('</details>'); // Go的正则分割等同于此
+            const parts = out.split('</details>');
             if (parts.length > 1) {
-              const content = parts[1]; // 取</details>之后的内容
-              if (content) { // 检查内容是否为空
+              const content = parts[1];
+              if (content) {
                 debugLog("Sending plain content from EditContent:", content);
                 const chunk: OpenAIResponse = {
                   id: `chatcmpl-${Date.now()}`,
@@ -349,8 +350,7 @@ async function handleStreamResponse(
               }
             }
           }
-          // --- 新增逻辑结束 ---
-      
+
           if (upstreamData.data.done || upstreamData.data.phase === "done") {
             debugLog("Stream end signal received in data.");
             break;
@@ -365,15 +365,18 @@ async function handleStreamResponse(
           model: MODEL_NAME,
           choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
         };
-        
-        // *** FIX: Encode the strings before enqueuing ***
+
+        // *** FIX: 在推入队列前，将字符串编码为 Uint8Array ***
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(endChunk)}\n\n`));
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        controller.close();
-        debugLog("Stream closed successfully.");
-
+        
       } catch (error) {
-        debugLog("An error occurred during streaming, connection likely closed by client.", error.message);
+        // 捕获更广泛的错误，例如上游连接被重置
+        debugLog("An error occurred during streaming, connection likely closed by client or upstream.", error.message);
+      } finally {
+        // 确保无论发生什么，流都会被关闭
+        try { controller.close(); } catch {}
+        debugLog("Stream closed.");
       }
     },
     cancel(reason) {
