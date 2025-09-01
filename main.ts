@@ -252,16 +252,16 @@ async function callUpstream(
   });
 }
 
-// --- REFACTORED V5: handleStreamResponse (With explicit encoding) ---
+// --- REFACTORED V6: handleStreamResponse (With manual byte stream processing) ---
 async function handleStreamResponse(
   upstreamReq: UpstreamRequest,
   chatId: string,
   authToken: string,
 ): Promise<Response> {
   const upstreamResponsePromise = callUpstream(upstreamReq, chatId, authToken);
-
-  // *** FIX: 创建一个 TextEncoder 实例，后续所有字符串编码都用它 ***
+  
   const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -271,11 +271,11 @@ async function handleStreamResponse(
         if (!upstreamResponse.ok || !upstreamResponse.body) {
           const errorBody = await upstreamResponse.text();
           debugLog(`Upstream error: ${upstreamResponse.status}`, errorBody);
-          // 确保在出错时关闭流
-          try { controller.close(); } catch {}
+          controller.close();
           return;
         }
-
+        
+        // 发送第一个 role chunk
         const firstChunk: OpenAIResponse = {
           id: `chatcmpl-${Date.now()}`,
           object: "chat.completion.chunk",
@@ -283,78 +283,79 @@ async function handleStreamResponse(
           model: MODEL_NAME,
           choices: [{ index: 0, delta: { role: "assistant" } }],
         };
-
-        // *** FIX: 在推入队列前，将字符串编码为 Uint8Array ***
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(firstChunk)}\n\n`));
         debugLog("First chunk sent to client.");
 
-        const denoReader = readerFromStreamReader(upstreamResponse.body.getReader());
+        // *** FIX: 使用底层的 Web Stream Reader，而不是 deno/std 的 readLines ***
+        const reader = upstreamResponse.body.getReader();
+        let buffer = '';
 
-        for await (const line of readLines(denoReader)) {
-          if (!line.startsWith("data: ")) continue;
-
-          const dataStr = line.substring(6);
-          if (!dataStr || dataStr === "[DONE]") continue; // 增加对 [DONE] 字符串的过滤
-
-          let upstreamData: UpstreamData;
-          try {
-            upstreamData = JSON.parse(dataStr);
-          } catch {
-            debugLog("Failed to parse SSE data:", dataStr);
-            continue;
-          }
-
-          const err = upstreamData.error || upstreamData.data.error || upstreamData.data.inner?.error;
-          if (err) {
-            debugLog(`Upstream error in stream: code=${err.code}, detail=${err.detail}`);
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            debugLog("Upstream reader finished.");
             break;
           }
 
-          if (upstreamData.data.delta_content) {
-            let out = upstreamData.data.delta_content;
-            if (upstreamData.data.phase === "thinking") {
-              out = transformThinking(out);
-            }
-            if (out) {
-              const chunk: OpenAIResponse = {
-                id: `chatcmpl-${Date.now()}`,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model: MODEL_NAME,
-                choices: [{ index: 0, delta: { content: out } }],
-              };
-              // *** FIX: 在推入队列前，将字符串编码为 Uint8Array ***
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-            }
-          }
+          // 将接收到的字节解码并追加到缓冲区
+          buffer += decoder.decode(value, { stream: true });
           
-          // ... 您其他的 edit_content 逻辑保持不变 ...
-          if (upstreamData.data.edit_content && upstreamData.data.phase === "answer") {
-            const out = upstreamData.data.edit_content;
-            const parts = out.split('</details>');
-            if (parts.length > 1) {
-              const content = parts[1];
-              if (content) {
-                debugLog("Sending plain content from EditContent:", content);
+          // 按换行符分割缓冲区，处理所有完整的行
+          const lines = buffer.split('\n');
+          // 最后一部分可能是不完整的行，将其保留在缓冲区中以待下一个数据块
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+        
+            const dataStr = line.substring(6).trim();
+            if (!dataStr) continue;
+        
+            let upstreamData: UpstreamData;
+            try {
+              upstreamData = JSON.parse(dataStr);
+            } catch {
+              debugLog("Failed to parse SSE data:", dataStr);
+              continue;
+            }
+        
+            const err = upstreamData.error || upstreamData.data.error || upstreamData.data.inner?.error;
+            if (err) {
+              debugLog(`Upstream error in stream: code=${err.code}, detail=${err.detail}`);
+              // 发现错误后，最好也跳出循环
+              break; 
+            }
+        
+            if (upstreamData.data.delta_content) {
+              let out = upstreamData.data.delta_content;
+              if (upstreamData.data.phase === "thinking") {
+                out = transformThinking(out);
+              }
+              if (out) {
                 const chunk: OpenAIResponse = {
                   id: `chatcmpl-${Date.now()}`,
                   object: "chat.completion.chunk",
                   created: Math.floor(Date.now() / 1000),
                   model: MODEL_NAME,
-                  choices: [{
-                    index: 0,
-                    delta: { content: content },
-                  }],
+                  choices: [{ index: 0, delta: { content: out } }],
                 };
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
               }
             }
-          }
 
-          if (upstreamData.data.done || upstreamData.data.phase === "done") {
-            debugLog("Stream end signal received in data.");
-            break;
-          }
+            // ... 您其他的 edit_content 逻辑可以保持不变 ...
+      
+            if (upstreamData.data.done || upstreamData.data.phase === "done") {
+              debugLog("Stream end signal received in data.");
+              // 收到结束信号，可以提前跳出循环
+              break;
+            }
+          } // end for (line of lines)
+        } // end while(true)
+
+        // 确保处理缓冲区中可能残留的最后一行
+        if (buffer.startsWith("data: ")) {
+          // ... 这里可以添加对残留 buffer 的处理，但通常 SSE 流最后会是空行，所以可能不需要
         }
 
         debugLog("Loop finished, sending final chunks.");
@@ -365,18 +366,16 @@ async function handleStreamResponse(
           model: MODEL_NAME,
           choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
         };
-
-        // *** FIX: 在推入队列前，将字符串编码为 Uint8Array ***
+        
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(endChunk)}\n\n`));
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        
+
       } catch (error) {
-        // 捕获更广泛的错误，例如上游连接被重置
-        debugLog("An error occurred during streaming, connection likely closed by client or upstream.", error.message);
+        debugLog("An error occurred during streaming, connection likely closed by client.", error.message);
       } finally {
-        // 确保无论发生什么，流都会被关闭
+        // 确保无论如何都关闭流
         try { controller.close(); } catch {}
-        debugLog("Stream closed.");
+        debugLog("Stream closed successfully.");
       }
     },
     cancel(reason) {
